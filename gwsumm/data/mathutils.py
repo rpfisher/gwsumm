@@ -22,6 +22,7 @@
 import operator
 import re
 
+from gwpy.detector import Channel
 from gwpy.segments import SegmentList
 
 from ..channels import (get_channel, re_channel)
@@ -41,7 +42,7 @@ OPERATOR = {
 }
 
 re_math = re.compile('(?P<operator>.+?)'
-                     '(?P<value>[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?)$')
+                     '(?P<value>[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?)')
 
 
 def parse_math_definition(definition):
@@ -72,11 +73,13 @@ def parse_math_definition(definition):
         match = next(breaks)
     except StopIteration:  # no channel names parsed at all, just return
         return [(definition, None)], []
+    if Channel.MATCH.match(definition):  # channel name matches (GEO)
+        return [(definition, None)], []
     while True:
         # find channel
         a, b = match.span()
         cname = definition[a:b]
-        channels.append((cname, None))
+        channels.append((cname, []))
 
         # find next channel and parse whatever's inbetween
         try:
@@ -96,15 +99,14 @@ def parse_math_definition(definition):
         if c is not None:  # if between channels, find the combiner
             operators.append(get_operator(mathstr[-1]))
             mathstr = mathstr[:-1].strip()
-        try:  # then parse some math to apply to the current channel
-            cop = re_math.match(mathstr).groupdict()
-        except AttributeError:
-            if mathstr:
-                raise ValueError("Cannot parse math operation %r" % mathstr)
-        else:
-            op = get_operator(cop['operator'].strip())
-            value = float(cop['value'])
-            channels[-1] = (cname, (op, value))  # record math to be done
+        matches = [m.groupdict() for m in re_math.finditer(mathstr)]
+        if mathstr and not matches:
+            raise ValueError("Cannot parse math operation %r" % mathstr)
+        elif matches:
+            for cop in matches:
+                op = get_operator(cop['operator'].strip())
+                value = float(cop['value'])
+                channels[-1][1].append((op, value))  # record math to be done
         if c is None:  # if at the end, break
             break
     return channels, operators
@@ -151,7 +153,7 @@ def get_with_math(channel, segments, load_func, get_func, **ioargs):
     else:
         tsdict = load_func(chans, segments, **ioargs)
     # shortcut single channel with no math
-    if len(names) == 1 and singleops[0][1] is None:
+    if len(names) == 1 and not singleops[0][1]:
         return tsdict.values()[0]
     # get union of segments for all sub-channels
     tslist = [tsdict[c.ndsname] for c in chans]
@@ -164,14 +166,14 @@ def get_with_math(channel, segments, load_func, get_func, **ioargs):
         ts.name = str(channel)
         # apply math to this channel
         cmath = singleops[0][1]
-        if cmath is not None:
-            ts = cmath[0](ts, cmath[1])
+        for op_, val_ in cmath:
+            ts = op_(ts, val_)
         # for each other channel do the same
         for joinop, ch in zip(joinoperators, singleops[1:]):
             name, cmath = ch
             data, = get_func(name, SegmentList([seg]), **ioargs)
-            if cmath is not None:  # apply simple math
-                data = cmath[0](data, cmath[1])
+            for op_, val_ in cmath:
+                data = op_(data, val_)
             ts = joinop(ts, data)  # apply combination math
         meta.append(ts)
     return meta
